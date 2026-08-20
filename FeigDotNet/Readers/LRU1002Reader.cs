@@ -45,12 +45,30 @@ namespace FeigDotNet.Readers
         {
             byte[] data = this.Connection.SendAndRecieve(0xFF, 0xB0, 0x01, 0x00);
 
+            if (data.Length < 3)
+            {
+                throw new FeigConnectionException("Invalid reader response");
+            }
+
+            if (data[0] == 0x00 && data[1] == 0xb0 && data[2] == 0x01)
+            {
+                return new List<FeigTag>();
+            }
+
+            if (data[0] == 0x00 && data[1] == 0xb0 && data[2] == 0x84)
+            {
+                throw new FeigInventoryException(data[2], "antennas not ready, check attachments");
+            }
+
+            if (!(data[0] == 0x00 && data[1] == 0xb0 && data[2] == 0x00))
+            {
+                throw new FeigInventoryException(data[2], "inventory failed with status 0x" + data[2].ToString("X2"));
+            }
+
             MemoryStream memoryStream = new MemoryStream(data);
-            memoryStream.Position = 0;
+            memoryStream.Position = 3;
 
             BinaryReader reader = new BinaryReader(memoryStream);
-
-            byte[] readBytes = reader.ReadBytes(3);
 
             short tagsCount = reader.ReadByte();
 
@@ -62,7 +80,7 @@ namespace FeigDotNet.Readers
                 byte type = reader.ReadByte();
                 byte[] ps = reader.ReadBytes(2);
 
-                switch (type) // type = number of bytes + 2, should we remove the switch? 
+                switch (type)
                 {
                     case 0x12:
                         tags.Add(new FeigTag {SerialNumber = reader.ReadBytes(16)});

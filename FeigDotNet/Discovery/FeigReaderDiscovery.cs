@@ -10,70 +10,119 @@ namespace FeigDotNet.Discovery
 {
     public class FeigReaderDiscovery
     {
+        private static readonly IPEndPoint DiscoveryEndpoint = new IPEndPoint(IPAddress.Parse("224.0.36.50"), 50000);
+        private static readonly byte[] DiscoveryCommand = { 0x01, 0x00, 0x00, 0x1c, 0x9b };
+
         public IList<NetworkInterface> ListNetworkInterfaces()
         {
-            return NetworkInterface.GetAllNetworkInterfaces()
-                .Where(
-                    ni =>
-                        ni.NetworkInterfaceType == NetworkInterfaceType.Ethernet &&
-                        ni.GetIPProperties().MulticastAddresses.Any() &&
-                        ni.SupportsMulticast &&
-                        ni.OperationalStatus == OperationalStatus.Up &&
-                        ni.GetIPProperties().GetIPv4Properties() != null
-                )
-                .ToList();
+            List<NetworkInterface> interfaces = new List<NetworkInterface>();
+
+            foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up || !ni.SupportsMulticast)
+                {
+                    continue;
+                }
+
+                if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+                    ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    IPInterfaceProperties properties = ni.GetIPProperties();
+
+                    if (!properties.MulticastAddresses.Any() || properties.GetIPv4Properties() == null)
+                    {
+                        continue;
+                    }
+                }
+                catch (NetworkInformationException)
+                {
+                    continue;
+                }
+
+                interfaces.Add(ni);
+            }
+
+            return interfaces;
         }
 
         public IDictionary<NetworkInterface, List<FeigReaderInfo>> FindReaders(IEnumerable<NetworkInterface> networkInterfaces, int timeout = 1000)
         {
             return networkInterfaces
                 .AsParallel()
-                .Select(ni =>
+                .SelectMany(ni => this.DiscoverOnInterface(ni, timeout))
+                .ToList()
+                .GroupBy(k => k.NetworkInterface)
+                .ToDictionary(k => k.Key, v => v.Select(r => r.ReaderInfo).ToList());
+        }
+
+        private IEnumerable<DiscoveryHit> DiscoverOnInterface(NetworkInterface networkInterface, int timeout)
+        {
+            List<DiscoveryHit> hits = new List<DiscoveryHit>();
+            IPv4InterfaceProperties ipv4;
+
+            try
+            {
+                ipv4 = networkInterface.GetIPProperties().GetIPv4Properties();
+            }
+            catch (NetworkInformationException)
+            {
+                return hits;
+            }
+
+            if (ipv4 == null)
+            {
+                return hits;
+            }
+
+            using (Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+            {
+                socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, IPAddress.HostToNetworkOrder(ipv4.Index));
+                socket.ReceiveTimeout = Math.Max(50, Math.Min(timeout, 250));
+
+                try
                 {
-                    using (Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+                    socket.SendTo(DiscoveryCommand, DiscoveryEndpoint);
+                }
+                catch (SocketException)
+                {
+                    return hits;
+                }
+
+                DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeout);
+
+                while (DateTime.UtcNow < deadline)
+                {
+                    try
                     {
-                        socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, (int) IPAddress.HostToNetworkOrder(ni.GetIPProperties().GetIPv4Properties().Index));
-                        socket.ReceiveTimeout = 200;
+                        byte[] receiveBytes = new byte[256];
+                        EndPoint remoteEndpoint = new IPEndPoint(IPAddress.Any, 0);
+                        int length = socket.ReceiveFrom(receiveBytes, ref remoteEndpoint);
 
-                        IPEndPoint destinationEndpoint = new IPEndPoint(IPAddress.Parse("224.0.36.50"), 50000);
-                        EndPoint localEndpoint = new IPEndPoint(IPAddress.Any, 0);
-
-                        var discoveryCommandBytes = new byte[5] {0x01, 0x00, 0x00, 0x1c, 0x9b};
-
-                        socket.SendTo(discoveryCommandBytes, 0, 5, SocketFlags.None, destinationEndpoint);
-
-                        try
+                        if (length >= 30 &&
+                            receiveBytes[0] == 0x01 &&
+                            receiveBytes[1] == 0x00 &&
+                            (receiveBytes[3] & 0x04) == 0x04)
                         {
-                            byte[] receiveBytes = new Byte[256];
-                            int length = socket.ReceiveFrom(receiveBytes, ref localEndpoint);
-
-                            return new
+                            hits.Add(new DiscoveryHit
                             {
-                                networkInterface = ni,
-                                buffer = receiveBytes,
-                                length
-                            };
-                        }
-                        catch (SocketException)
-                        {
-                            return null;
+                                NetworkInterface = networkInterface,
+                                ReaderInfo = this.Parse(receiveBytes)
+                            });
                         }
                     }
-                })
-                .Where(r =>
-                    r != null &&
-                    r.length >= 30 &&
-                    r.buffer[0] == 0x01 &&
-                    r.buffer[1] == 0x00 &&
-                    ((r.buffer[3] & 0x04) == 0x04))
-                .Select(r => new
-                {
-                    r.networkInterface,
-                    readerInfo = this.Parse(r.buffer)
-                })
-                .ToList()
-                .GroupBy(k => k.networkInterface)
-                .ToDictionary(k => k.Key, v => v.Select(r => r.readerInfo).ToList());
+                    catch (SocketException)
+                    {
+                        // receive timed out; keep waiting until the overall deadline
+                    }
+                }
+            }
+
+            return hits;
         }
 
         private FeigReaderInfo Parse(byte[] buffer)
@@ -119,6 +168,12 @@ namespace FeigDotNet.Discovery
             }
 
             return readerInfo;
+        }
+
+        private sealed class DiscoveryHit
+        {
+            public NetworkInterface NetworkInterface { get; set; }
+            public FeigReaderInfo ReaderInfo { get; set; }
         }
     }
 }
